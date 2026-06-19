@@ -1,0 +1,550 @@
+---
+title: "damidBind manuscript figures and tables"
+author: "Owen Marshall"
+output: html_notebook
+---
+
+This file is an R Notebook of all of the analysis figures and tables from Marshall (2026) "damidBind: an R/Bioconductor package for differential DamID analysis and data exploration", with the exception of two larger multi-panel supplementary figures.
+
+The code for those figures, Fig. S5 and Fig. S7, is provided as R scripts separately within this archive.
+
+```{r}
+pacman::p_load(damidBind,dplyr,ggplot2)
+```
+ 
+```{r}
+#' Benchmark damidBind results against Xu et al 2024 bespoke analysis and 
+#' scRNA-seq markers as a form of ground truth
+#'
+#' @param results_obj A \code{DamIDResults} object.
+#' @param bespoke_obj Object provided by previous manual/bespoke analysis 
+#'   (expected to have \code{$upreg} and \code{$downreg} vectors).
+#' @param ground_truth_genes Character vector of gene symbols (e.g. scRNA-seq markers).
+#' @param target_cond Integer (1 or 2) indicating which condition to benchmark.
+#' @param label String. A label for the results (e.g., "L4 Neurons").
+#'
+#' @return A list containing:
+#'   \itemize{
+#'     \item \code{locus_stats}: Dataframe of Fisher's tests at the locus level.
+#'     \item \code{gene_stats}: Dataframe of Fisher's tests at the gene level.
+#'     \item \code{recovery_stats}: Dataframe showing percent recovery of bespoke 
+#'       results by the package.
+#'     \item \code{volcano_plot_all}: The volcano plot of the \code{damidBind} object, 
+#'       with significant bespoke hits from both conditions overlaid as highlights.
+#'     \item \code{volcano_plot_cond}: The volcano plot showing package hits, 
+#'       bespoke hits for the target condition, and ground truth markers.
+#'   }
+#' @export
+benchmark_results <- function(results_obj, 
+                              bespoke_obj, 
+                              ground_truth_genes, 
+                              target_cond = 1, 
+                              label = "Cell Type") {
+    
+    # Validation and data extraction
+    if (!inherits(results_obj, "DamIDResults")) {
+        stop("results_obj must be a DamIDResults object.")
+    }
+    
+    analysis_tab <- analysisTable(results_obj) %>%
+        tibble::rownames_to_column("locus")
+    
+    # Define significant loci for the package for the target condition
+    if (target_cond == 1) {
+        package_loci <- rownames(enrichedCond1(results_obj))
+        bespoke_loci <- bespoke_obj$upreg
+    } else {
+        package_loci <- rownames(enrichedCond2(results_obj))
+        bespoke_loci <- bespoke_obj$downreg
+    }
+    
+    # Map Loci to Genes
+    gene_locus_map <- analysis_tab %>%
+        dplyr::select(locus, gene_name) %>%
+        dplyr::filter(gene_name != "" & !is.na(gene_name)) %>%
+        tidyr::separate_rows(gene_name, sep = ",") %>%
+        dplyr::mutate(gene_name = trimws(gene_name))
+    
+    gene_universe <- unique(gene_locus_map$gene_name)
+    ground_truth_universe <- intersect(ground_truth_genes, gene_universe)
+    
+    # Locus-level Enrichment Test
+    gt_loci <- gene_locus_map %>%
+        dplyr::filter(gene_name %in% ground_truth_universe) %>%
+        dplyr::pull(locus) %>%
+        unique()
+    
+    analysis_tab <- analysis_tab %>%
+        dplyr::mutate(
+            is_gt = locus %in% gt_loci,
+            is_package = locus %in% package_loci,
+            is_bespoke = locus %in% bespoke_loci
+        )
+    
+    calc_locus_fet <- function(df, target_col, sub_label) {
+        # a: Sig + GT; b: Sig + Not GT; c: Not Sig + GT; d: Not Sig + Not GT
+        a <- sum(df[[target_col]] & df$is_gt)
+        b <- sum(df[[target_col]] & !df$is_gt)
+        c <- sum(!df[[target_col]] & df$is_gt)
+        d <- sum(!df[[target_col]] & !df$is_gt)
+        
+        ft <- fisher.test(matrix(c(a, c, b, d), nrow = 2))
+        
+        data.frame(
+            comparison = sub_label,
+            total_detected = sum(df[[target_col]]),
+            gt_overlap = a,
+            percent_overlap = (a / sum(df[[target_col]])) * 100,
+            odds_ratio = unname(ft$estimate),
+            p_value = ft$p.value
+        )
+    }
+    
+    locus_res <- dplyr::bind_rows(
+        calc_locus_fet(analysis_tab, "is_package", paste(label, "(Package Total)")),
+        calc_locus_fet(analysis_tab, "is_bespoke", paste(label, "(Xu et al Total)")),
+        calc_locus_fet(dplyr::filter(analysis_tab, !is_bespoke), "is_package", paste(label, "(Novel Only)"))
+    )
+    
+    # Gene-level Enrichment Test
+    package_genes <- gene_locus_map %>%
+        dplyr::filter(locus %in% package_loci) %>%
+        dplyr::pull(gene_name) %>%
+        unique()
+    
+    bespoke_genes <- gene_locus_map %>%
+        dplyr::filter(locus %in% bespoke_loci) %>%
+        dplyr::pull(gene_name) %>%
+        unique()
+    
+    calc_gene_fet <- function(test_genes, universe, ground_truth, sub_label) {
+        a <- length(intersect(test_genes, ground_truth))
+        b <- length(setdiff(test_genes, ground_truth))
+        c <- length(setdiff(ground_truth, test_genes))
+        d <- length(setdiff(universe, dplyr::union(test_genes, ground_truth)))
+        
+        ft <- fisher.test(matrix(c(a, c, b, d), nrow = 2))
+        
+        data.frame(
+            comparison = sub_label,
+            total_genes = length(test_genes),
+            gt_overlap = a,
+            percent_overlap = (a / length(test_genes)) * 100,
+            odds_ratio = unname(ft$estimate),
+            p_value = ft$p.value
+        )
+    }
+    
+    gene_res <- dplyr::bind_rows(
+        calc_gene_fet(package_genes, gene_universe, ground_truth_universe, paste(label, "(Package Total)")),
+        calc_gene_fet(bespoke_genes, gene_universe, ground_truth_universe, paste(label, "(Xu et al Total)")),
+        calc_gene_fet(
+            setdiff(package_genes, bespoke_genes), 
+            setdiff(gene_universe, bespoke_genes), 
+            setdiff(ground_truth_universe, bespoke_genes), 
+            paste(label, "(Novel Only)")
+        )
+    )
+    
+    locus_recovery <- length(intersect(package_loci, bespoke_loci))
+    gene_recovery <- length(intersect(package_genes, bespoke_genes))
+    
+    rec_stats <- data.frame(
+        level = c(sprintf("%s (locus)",label), sprintf("%s (gene)",label)),
+        bespoke_total = c(length(bespoke_loci), length(bespoke_genes)),
+        recovered = c(locus_recovery, gene_recovery),
+        percent_recovery = c(
+            (locus_recovery / length(bespoke_loci)) * 100,
+            (gene_recovery / length(bespoke_genes)) * 100
+        )
+    )
+    
+    # Visualisations 
+    # Global comparison
+    comp_plot <- plot_volcano(
+        results_obj,
+        highlight = list(
+            "L4 (Xu et al)" = bespoke_obj$upreg,
+            "L5 (Xu et al)" = bespoke_obj$downreg
+        ),
+        labels = "all",
+        highlight_config = list(
+            alpha = 0.5,
+            size = 0.8,
+            legend_inside_pos = "l"
+        ),
+    ) + ggplot2::labs(title = label)
+    
+    # Condition-specific comparison with scRNA-seq
+    v_plot <- plot_volcano(
+        results_obj,
+        highlight = list(
+            "Xu et al 2024" = bespoke_loci,
+            "scRNA-seq" = ground_truth_universe
+        ),
+        labels = "scRNA-seq",
+        highlight_config = list(
+            alpha = 0.5,
+            size = 0.8,
+            sig_labels_only = TRUE,
+            legend_inside_pos = "l"
+        )
+    ) + ggplot2::labs(title = label)
+    
+    return(list(
+        locus_stats = locus_res,
+        gene_stats = gene_res,
+        recovery_stats = rec_stats,
+        volcano_plot_all = comp_plot,
+        volcano_plot_cond = v_plot
+    ))
+}
+
+```
+
+## Analysis
+
+### Load up Xu et al 2024 analysis
+```{r}
+# load the pre-saved bespoke Bsh analysis:
+load("data/Xu_et_al_2024_data.RData")
+
+# scRNA-seq analysed subtype markers from the paper
+l4_spec_mar = read.csv("data/scRNA-seq_markers/l4_specific_March.csv",header=T,row.names = 1)
+names(l4_spec_mar)[1]="name"
+l5_spec_mar = read.csv("data/scRNA-seq_markers/l5_specific_March.csv",header=T,row.names = 1)
+names(l5_spec_mar)[1]="name"
+
+l4_rnaseq_spec_mar = capture.output(cat(l4_spec_mar$name,sep = "|"))
+l5_rnaseq_spec_mar = capture.output(cat(l5_spec_mar$name,sep = "|"))
+```
+
+
+### Fig S3 is a composite of the Limma diagnostic plots from the following:
+```{r load_data}
+# Perform the damidBind Bsh TaDa analysis
+# We use the same paths and settings as the original manuscript
+xubsh_loess <- load_data_peaks(
+    binding_profiles_path = "data/Bsh/*ph.gz",
+    peaks_path = "data/Bsh/*gff.gz",
+    norm_method = "loess",
+    plot_diagnostics = TRUE
+)
+
+xubsh_qnorm <- load_data_peaks(
+    binding_profiles_path = "data/Bsh/*ph.gz",
+    peaks_path = "data/Bsh/*gff.gz",
+    norm_method = "quantile",
+    plot_diagnostics = TRUE
+)
+
+xubsh_none <- load_data_peaks(
+    binding_profiles_path = "data/Bsh/*ph.gz",
+    peaks_path = "data/Bsh/*gff.gz",
+    norm_method = "none",
+    plot_diagnostics = TRUE
+)
+
+
+png("Fig_S3_%03d.png",width=(6.5*200), height=(5.5*200), res=200)
+
+xubsh_diff_loess <- differential_binding(
+    xubsh_loess,
+    cond = c("L4 neurons" = "L4", "L5 neurons" = "L5"),
+    plot_diagnostics = TRUE
+)
+
+xubsh_diff_qnorm <- differential_binding(
+    xubsh_qnorm,
+    cond = c("L4 neurons" = "L4", "L5 neurons" = "L5"),
+    plot_diagnostics = TRUE
+)
+
+xubsh_diff_none <- differential_binding(
+    xubsh_none,
+    cond = c("L4 neurons" = "L4", "L5 neurons" = "L5"),
+    plot_diagnostics = TRUE
+)
+
+dev.off()
+```
+
+### Run through the benchmark comparisons ...
+```{r}
+# scaled only
+none <- benchmark_results(
+    results_obj = xubsh_diff_none,
+    bespoke_obj = bespoke_bsh_results,
+    ground_truth_genes = l4_spec_mar$name,
+    target_cond = 1,
+    label = "L4 scaled-only"
+)
+
+none
+```
+
+### Fig. S6(A)
+```{r}
+# Quantile
+qnorm <- benchmark_results(
+    results_obj = xubsh_diff_qnorm,
+    bespoke_obj = bespoke_bsh_results,
+    ground_truth_genes = l4_spec_mar$name,
+    target_cond = 1,
+    label = "L4 neurons"
+)
+
+qnorm
+
+png("Fig_S6A_L4.png",width=6*300, height=4*300,res=300)
+qnorm$volcano_plot_cond
+dev.off()
+```
+
+```{r}
+# loess
+loess <- benchmark_results(
+    results_obj = xubsh_diff_loess,
+    bespoke_obj = bespoke_bsh_results,
+    ground_truth_genes = l4_spec_mar$name,
+    target_cond = 1,
+    label = "L4 loess norm"
+)
+
+loess
+```
+
+```{r}
+none_l5 <- benchmark_results(
+    results_obj = xubsh_diff_none,
+    bespoke_obj = bespoke_bsh_results,
+    ground_truth_genes = l5_spec_mar$name,
+    target_cond = 2,
+    label = "L5 scaled only"
+)
+
+none_l5
+```
+
+### Fig. S6(A)
+```{r}
+qnorm_l5 <- benchmark_results(
+    results_obj = xubsh_diff_qnorm,
+    bespoke_obj = bespoke_bsh_results,
+    ground_truth_genes = l5_spec_mar$name,
+    target_cond = 2,
+    label = "L5 neurons"
+)
+
+qnorm_l5
+
+png("Fig_S6A_L5.png",width=6*300, height=4*300,res=300)
+qnorm_l5$volcano_plot_cond
+dev.off()
+```
+
+```{r}
+# loess
+loess_l5 <- benchmark_results(
+    results_obj = xubsh_diff_loess,
+    bespoke_obj = bespoke_bsh_results,
+    ground_truth_genes = l5_spec_mar$name,
+    target_cond = 2,
+    label = "L5 loess norm"
+)
+
+loess_l5
+```
+
+### Table S4, Table S5
+```{r}
+table_out = do.call(rbind,list(qnorm$locus_stats,qnorm_l5$locus_stats,
+                               loess$locus_stats,loess_l5$locus_stats)
+                    )
+table_out
+table_out <- table_out %>%
+  mutate(p_value = formatC(p_value, format = "e", digits = 2))
+knitr::kable(table_out,digits=2) %>% kableExtra::kable_styling()
+```
+
+### Table S6 
+```{r}
+table_out_recovery = do.call(rbind,list(qnorm$recovery_stats,qnorm_l5$recovery_stats,loess$recovery_stats,loess_l5$recovery_stats))
+table_out_recovery
+knitr::kable(table_out_recovery,digits=2) %>% kableExtra::kable_styling()
+```
+
+
+
+### Figure S4
+```{r}
+xucat_none = load_data_peaks(
+    binding_profiles_path = "data/catada/*ph.gz", 
+    peaks_path = "data/catada/*gff.gz",
+    pre_scale=FALSE, 
+    norm_method = "none")
+
+xucat_diff_none = differential_accessibility(xucat_none,cond=c("L4 neurons"="L4","L5 neurons"="L5"))
+
+mean_variance = plot_catada_mean_variance(xucat_diff_none)
+
+ggsave("Fig_S4.pdf",mean_variance,width=6,height=3.5)
+```
+
+
+```{r}
+
+xucat_qnorm =  load_data_peaks(
+    binding_profiles_path = "data/catada/*ph.gz", 
+    peaks_path = "data/catada/*gff.gz",
+    pre_scale=FALSE, 
+    norm_method = "quantile")
+
+xucat_diff = differential_accessibility(xucat_qnorm,cond=c("L4 neurons"="L4","L5 neurons"="L5"))
+```
+
+
+### Fig S6(B)
+```{r}
+catada_l4 <- benchmark_results(
+    results_obj = xucat_diff,
+    bespoke_obj = bespoke_catada_results,
+    ground_truth_genes = l4_spec_mar$name,
+    target_cond = 1,
+    label = "L4 neurons"
+)
+
+catada_l4
+
+png("Fig_S6B_L4.png",width=6*300, height=4*300,res=300)
+catada_l4$volcano_plot_cond
+dev.off()
+```
+
+```{r}
+catada_l5 <- benchmark_results(
+    results_obj = xucat_diff,
+    bespoke_obj = bespoke_catada_results,
+    ground_truth_genes = l5_spec_mar$name,
+    target_cond = 2,
+    label = "L5 neurons"
+)
+
+catada_l5
+
+png("Fig_S6B_L5.png",width=6*300, height=4*300,res=300)
+catada_l5$volcano_plot_cond
+dev.off()
+```
+
+### Table S8 and Table S9
+```{r}
+table_out.catada = do.call(rbind,list(catada_l4$locus_stats, catada_l5$locus_stats))
+table_out.catada
+table_out.catada <- table_out.catada %>%
+  mutate(p_value = formatC(p_value, format = "e", digits = 2))
+knitr::kable(table_out.catada,digits=2) %>% kableExtra::kable_styling()
+
+table_out_recovery.catada = do.call(rbind,list(catada_l4$recovery_stats,catada_l5$recovery_stats))
+table_out_recovery.catada
+knitr::kable(table_out_recovery.catada,digits=2) %>% kableExtra::kable_styling()
+```
+
+
+### Figure 1B panel
+```{r}
+plot_volcano(xucat_diff,
+             label_config=NULL,
+             highlight=list(
+                 "L4 specific"=l4_spec_mar$name,
+                 "L5 specific"=l5_spec_mar$name
+                 ),
+             label_display = list(r=0.25),
+             highlight_config = list(
+                 legend_inside_pos='l',
+                 text_col=T,
+                 size=1,
+                 text_luminosity=40, 
+                 sig_labels_only=T,
+                 max_overlaps=8
+                 ),
+             save = list(
+                 filename="Fig_1B_CATaDa",
+                 format="svg",
+                 width=6,
+                 height=4
+                )
+)
+```
+
+### Figure 1B panel
+```{r}
+plot_volcano(xubsh_diff_qnorm,
+             label_config=NULL,
+             highlight=list(
+                 "L4 specific"=l4_spec_mar$name,
+                 "L5 specific"=l5_spec_mar$name
+                 ),
+             label_display = list(r=0.25),
+             highlight_config = list(
+                 legend_inside_pos='l',
+                 text_col=T,
+                 text_luminosity=40, 
+                 sig_labels_only=T,
+                 size=1,
+                 max_overlaps=8
+                 ),
+             save = list(
+                 filename="Fig_1B_Bsh",
+                 format="svg",
+                 width=6,
+                 height=4
+                )
+             )
+```
+
+
+### Figure S2
+```{r}
+bsh_l5_bias_q = test_weighting_vs_bias_artifact(xubsh_diff_qnorm,"Bsh_Dam_L5_r1-ext300-vs-Dam.kde-norm_qnorm")
+
+png("Fig_S2.png", width = 3000, height = 1500, res = 300)
+bsh_l5_bias_q$plot
+dev.off()
+```
+
+### Table S3
+```{r}
+test_weighting_vs_bias_batch(xubsh_diff_qnorm)
+```
+
+## Load up NSC / Neuron data
+### Figure S8 is taken from the occupancy diagnostic plots
+```{r}
+nvsn = load_data_genes(binding_profiles_path = c("data/RNAPII_TaDa/*ph.gz"),
+                       norm_method = "quantile",
+                       occupancy_plot_diagnostics = T)
+```
+
+```{r}
+nvsn.diff = differential_binding(nvsn, cond=c("NSCs"="Wor","Neurons"="elav"))
+```
+
+### This figure didn't make it into the manuscript, but kinda neat regardless if you care for Drosophila neural dev biol :)
+```{r}
+go.nscs = analyse_go_enrichment(nvsn.diff,direction="NSCs",maxGSSize = 500,show_category = 18, label_format_width = 60, fit_labels = F)
+go.neurons = analyse_go_enrichment(nvsn.diff,direction="Neurons",maxGSSize = 500,show_category = 18, label_format_width = 60, fit_labels = F)
+
+getgo = function (go_analyis,go_id) {stringr::str_split(go_analyis$results_table[go_id,"geneID"],"/") |> unlist()}
+syn_signalling = getgo(go.neurons,"GO:0099536")
+neuroblast_diff = getgo(go.nscs,"GO:0014016")
+
+plot_volcano(nvsn.diff, 
+             label_config=NULL, 
+             highlight = list(
+                "Neuroblast differentiation"=neuroblast_diff, 
+                "Synaptic signalling"=syn_signalling
+                ), 
+             highlight_config = list(max_overlaps=15, clean_names=T),
+             fdr_filter_threshold = 0.01)
+```

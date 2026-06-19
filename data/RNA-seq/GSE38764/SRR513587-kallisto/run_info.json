@@ -1,0 +1,13 @@
+{
+	"n_targets": 31165,
+	"n_bootstraps": 0,
+	"n_processed": 46773808,
+	"n_pseudoaligned": 40580887,
+	"n_unique": 13245023,
+	"p_pseudoaligned": 86.8,
+	"p_unique": 28.3,
+	"kallisto_version": "0.46.1",
+	"index_version": 10,
+	"start_time": "Sat Apr 25 04:28:03 2026",
+	"call": "kallisto quant -i /mnt/genomes/owen/adult_neurons_elav_rnaseq_2023/kallisto_index_dm_rel113.idx -o SRR513587-kallisto --genomebam -t 14 --gtf /mnt/genomes/owen/adult_neurons_elav_rnaseq_2023/Drosophila_melanogaster.BDGP6.46.113.gtf.gz SRR513587_1.fastq SRR513587_2.fastq"
+}
